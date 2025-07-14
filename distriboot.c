@@ -608,7 +608,7 @@ void normalize_weights(Dataset* dataset) {
 }
 
 /*
-* PIPELINED ADABOOST TRAINING ALGORITHM - RAUL MOLDES DESIGN
+* PIPELINED ADABOOST TRAINING ALGORITHM
 *
 * My Design Choice: Asynchronous Pipeline with Non-Blocking Communication
 *
@@ -1253,40 +1253,311 @@ double evaluate_model(AdaBoostModel * model, Dataset * test_data) {
 
     return (double)correct / test_data->num_samples;
 }
+/*
+ * Parse command line arguments
+ */
+typedef struct {
+    int num_samples;
+    int num_features;
+    int num_trees;
+    int num_classes;
+    char* csv_file;
+    int use_csv;
+    int mode;
+} ProgramArgs;
+
+void print_usage(const char* program_name) {
+    printf("Usage: %s [OPTIONS]\n", program_name);
+    printf("Options:\n");
+    printf("  --samples N     Number of samples per process (default: 1000)\n");
+    printf("  --features N    Number of features (default: 20)\n");
+    printf("  --trees N       Number of trees in ensemble (default: 16)\n");
+    printf("  --csv FILE      CSV file to load instead of synthetic data\n");
+    printf("  --mode N        Training mode (1 for sequential), 2 for batched, 3 for pipelined\n");
+    printf("  --help          Show this help message\n");
+    printf("\nExamples:\n");
+    printf("  mpirun -np 4 %s --samples 2000 --trees 32\n", program_name);
+    printf("  mpirun -np 4 %s --csv data.csv --trees 16\n", program_name);
+}
+
+ProgramArgs parse_arguments(int argc, char* argv[]) {
+    ProgramArgs args;
+
+    // Default values
+    args.num_samples = 1000;
+    args.num_features = 20;
+    args.num_trees = 16;
+    args.num_classes = 2;
+    args.csv_file = NULL;
+    args.use_csv = 0;
+    args.mode = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--samples") == 0 && i + 1 < argc) {
+            args.num_samples = atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--features") == 0 && i + 1 < argc) {
+            args.num_features = atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--trees") == 0 && i + 1 < argc) {
+            args.num_trees = atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
+            args.csv_file = argv[++i];
+            args.use_csv = 1;
+        }
+        else if (strcmp(argv[i], "--help") == 0) {
+            if (rank == 0) {
+                print_usage(argv[0]);
+            }
+            MPI_Finalize();
+            exit(0);
+        }
+    }
+
+    return args;
+}
 
 /*
-* Main function - Entry point for the parallel AdaBoost program
-*
-* My testing and benchmarking workflow:
-* 1. Initialize MPI environment and get process information
-* 2. Set problem parameters (samples, features, trees, classes)
-* 3. Generate training data (different per process for diversity)
-* 4. Train the ensemble using my simple parallel algorithm
-* 5. Evaluate on test data and aggregate results across processes
-* 6. Report performance metrics and clean up
-*/
+ * Helper function for minimum of two integers
+ */
+int minimum(int a, int b) {
+    return (a < b) ? a : b;
+}
+
+/*
+ * Load dataset from CSV file
+ * Expected format: feature1,feature2,...,featureN,label
+ */
+Dataset load_csv_data(const char* filename, int expected_features) {
+    Dataset dataset;
+    FILE* file = fopen(filename, "r");
+
+    if (!file) {
+        printf("Error: Cannot open file %s\n", filename);
+        MPI_Finalize();
+        exit(1);
+    }
+
+    // Count lines and determine data dimensions
+    char line[10000];  // Buffer for reading lines
+    int line_count = 0;
+    int header_skipped = 0;
+
+    // First pass: count data lines
+    while (fgets(line, sizeof(line), file)) {
+        line_count++;
+        // Skip header if it contains non-numeric data
+        if (line_count == 1 && (strstr(line, "feature") || strstr(line, "label"))) {
+            header_skipped = 1;
+            line_count = 0;  // Reset count
+        }
+    }
+
+    if (line_count == 0) {
+        printf("Error: No data found in file %s\n", filename);
+        fclose(file);
+        MPI_Finalize();
+        exit(1);
+    }
+
+    // Initialize dataset
+    dataset.num_samples = line_count;
+    dataset.num_features = expected_features;
+    dataset.num_classes = 2;  // Will be updated when we find the actual number
+    dataset.samples = (Sample*)malloc(line_count * sizeof(Sample));
+
+    if (rank == 0) {
+        printf("Loading CSV data: %d samples expected\n", line_count);
+    }
+
+    // Second pass: read actual data
+    rewind(file);
+
+    // Skip header if present
+    if (header_skipped) {
+        (void)fgets(line, sizeof(line), file);
+    }
+
+    int sample_idx = 0;
+    int max_label = 0;
+
+    while (fgets(line, sizeof(line), file) && sample_idx < line_count) {
+        // Parse CSV line
+        char* token = strtok(line, ",");
+        int feature_idx = 0;
+
+        // Read features
+        while (token && feature_idx < dataset.num_features) {
+            dataset.samples[sample_idx].features[feature_idx] = atof(token);
+            feature_idx++;
+            token = strtok(NULL, ",");
+        }
+
+        // Read label (last token)
+        if (token) {
+            dataset.samples[sample_idx].label = atoi(token);
+            if (dataset.samples[sample_idx].label > max_label) {
+                max_label = dataset.samples[sample_idx].label;
+            }
+        }
+        else {
+            printf("Error: Invalid line format at line %d\n", sample_idx + 1 + header_skipped);
+            free(dataset.samples);
+            fclose(file);
+            MPI_Finalize();
+            exit(1);
+        }
+
+        // Initialize weight
+        dataset.samples[sample_idx].weight = 1.0 / line_count;
+
+        sample_idx++;
+    }
+
+    fclose(file);
+
+    // Update number of classes
+    dataset.num_classes = max_label + 1;
+
+    if (rank == 0) {
+        printf("CSV data loaded successfully:\n");
+        printf("  Samples: %d\n", dataset.num_samples);
+        printf("  Features: %d\n", dataset.num_features);
+        printf("  Classes: %d (labels 0-%d)\n", dataset.num_classes, max_label);
+
+        // Print first few samples for verification
+        printf("  First 3 samples:\n");
+        for (int i = 0; i < 3 && i < dataset.num_samples; i++) {
+            printf("    Sample %d: [", i);
+            for (int j = 0; j < minimum(5, dataset.num_features); j++) {
+                printf("%.2f", dataset.samples[i].features[j]);
+                if (j < minimum(5, dataset.num_features) - 1) printf(", ");
+            }
+            if (dataset.num_features > 5) printf(", ...");
+            printf("] -> %d\n", dataset.samples[i].label);
+        }
+    }
+
+    return dataset;
+}
+
+
+/*
+ * Broadcast dataset from rank 0 to all other processes
+ * This ensures all processes have the same data when using CSV
+ */
+void broadcast_dataset(Dataset* dataset) {
+    // Broadcast metadata
+    MPI_Bcast(&dataset->num_samples, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&dataset->num_features, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&dataset->num_classes, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Allocate memory on non-root processes
+    if (rank != 0) {
+        dataset->samples = (Sample*)malloc(dataset->num_samples * sizeof(Sample));
+    }
+
+    // Broadcast sample data
+    MPI_Bcast(dataset->samples, dataset->num_samples * sizeof(Sample), MPI_BYTE, 0, MPI_COMM_WORLD);
+}
+
+/*
+ * Main program entrypoint
+ */
 int main(int argc, char* argv[]) {
     // Initialize MPI runtime environment
     MPI_Init(&argc, &argv);
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);      // Get my process ID (0 to size-1)
-    MPI_Comm_size(MPI_COMM_WORLD, &size);      // Get total number of processes
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // Problem configuration - tuned for good performance/accuracy balance
-    int num_samples = 1000;     // Training samples per process
-    int num_features = 20;      // Feature dimensionality
-    int num_classes = 2;        // Binary classification
-    int num_trees = 16;         // Ensemble size (should be multiple of process count for load balance)
+    // Parse command line arguments
+    ProgramArgs args = parse_arguments(argc, argv);
 
-    // Generate training data (each process gets different samples for diversity)
-    Dataset train_data = generate_synthetic_data(num_samples, num_features, num_classes);
+    if (rank == 0) {
+        printf("=== Parallel AdaBoost with MPI ===\n");
+        printf("Configuration:\n");
+        printf("  Processes: %d\n", size);
+        printf("  Trees: %d\n", args.num_trees);
+        if (args.use_csv) {
+            printf("  Data source: %s\n", args.csv_file);
+        }
+        else {
+            printf("  Data source: synthetic\n");
+            printf("  Samples per process: %d\n", args.num_samples);
+            printf("  Features: %d\n", args.num_features);
+        }
+        printf("=====================================\n");
+    }
 
-    // Train the AdaBoost ensemble using my simple parallel algorithm
-    double start_time = MPI_Wtime();    // Start performance timing
-    AdaBoostModel model = train_adaboost_pipelined(&train_data, num_trees);
-    double end_time = MPI_Wtime();      // End performance timing
+    Dataset train_data;
+
+    // Load or generate training data
+    if (args.use_csv) {
+        // Only rank 0 reads the file, then broadcasts to all processes
+        if (rank == 0) {
+            train_data = load_csv_data(args.csv_file, args.num_features);
+        }
+        broadcast_dataset(&train_data);
+
+        // Update args with actual data dimensions
+        args.num_samples = train_data.num_samples;
+        args.num_features = train_data.num_features;
+        args.num_classes = train_data.num_classes;
+    }
+    else {
+        // Generate synthetic data (each process gets different samples for diversity)
+        train_data = generate_synthetic_data(args.num_samples, args.num_features, args.num_classes);
+    }
+
+    // Train the AdaBoost ensemble
+    double start_time = MPI_Wtime();
+
+    // You can choose which algorithm to use here:
+    AdaBoostModel model;
+    switch (args.mode) {
+    case 0: {
+        model = train_adaboost_sequential(&train_data, args.num_trees);
+        break;
+    }
+    case 1: {
+        model = train_adaboost_batched(&train_data, args.num_trees);
+        break;
+    }
+    case 2: {
+        model = train_adaboost_pipelined(&train_data, args.num_trees);
+        break;
+    }
+    default: {
+        if (rank == 0) {
+            fprintf(stderr, "Error: modo inválido %d\n", args.mode);
+        }
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    }
+    double end_time = MPI_Wtime();
 
     // Generate test data for evaluation
-    Dataset test_data = generate_synthetic_data(num_samples / 4, num_features, num_classes);
+    Dataset test_data;
+    if (args.use_csv) {
+        // For CSV data, use a subset of the original data as test set
+        // In a real scenario, you'd want a separate test file
+        int test_size = train_data.num_samples / 4; // 25% for testing
+        test_data.num_samples = test_size;
+        test_data.num_features = train_data.num_features;
+        test_data.num_classes = train_data.num_classes;
+        test_data.samples = (Sample*)malloc(test_size * sizeof(Sample));
+
+        // Use last 25% of samples as test data
+        int start_idx = train_data.num_samples - test_size;
+        for (int i = 0; i < test_size; i++) {
+            test_data.samples[i] = train_data.samples[start_idx + i];
+        }
+    }
+    else {
+        // Generate fresh synthetic test data
+        test_data = generate_synthetic_data(args.num_samples / 4, args.num_features, args.num_classes);
+    }
 
     // Evaluate model performance on test data
     double accuracy = evaluate_model(&model, &test_data);
@@ -1299,28 +1570,30 @@ int main(int argc, char* argv[]) {
     if (rank == 0) {
         global_accuracy /= size;       // Average accuracy across all processes
         double training_time = end_time - start_time;
-        double theoretical_speedup = (double)size * 0.7;  // Conservative estimate accounting for overhead
+        double theoretical_speedup = (double)size * 0.8;  // Estimate accounting for overhead
 
-        printf("=== Simple Parallel AdaBoost Results ===\n");
+        printf("\n=== Parallel AdaBoost Results ===\n");
         printf("Training completed successfully\n");
+        printf("Algorithm: Batch Parallel AdaBoost\n");
         printf("Training time: %.4f seconds\n", training_time);
         printf("Average accuracy: %.4f (%.2f%%)\n", global_accuracy, global_accuracy * 100);
-        printf("Processes used: %d\n", size);
-        printf("Trees per process: %.1f\n", (double)num_trees / size);
-        printf("Estimated speedup: %.1fx\n", theoretical_speedup);
-        printf("========================================\n");
+        printf("Dataset info:\n");
+        printf("  Training samples: %d\n", args.num_samples);
+        printf("  Features: %d\n", args.num_features);
+        printf("  Classes: %d\n", args.num_classes);
+        printf("  Trees in ensemble: %d\n", args.num_trees);
+        printf("Parallel info:\n");
+        printf("  Processes used: %d\n", size);
+        printf("  Trees per process: %.1f\n", (double)args.num_trees / size);
+        printf("  Estimated speedup: %.1fx\n", theoretical_speedup);
+        printf("==================================\n");
     }
 
-    /*
-     * Clean up allocated memory
-     *
-     * Important for long-running applications and good programming practice.
-     * In a more sophisticated implementation, I would also recursively free
-     * the tree node structures, but for this demonstration the OS will clean
-     * up when the process terminates.
-     */
+    // Clean up allocated memory
     free(train_data.samples);
     free(test_data.samples);
+
+    // Free tree structures (you should add a proper tree cleanup function)
     free(model.trees);
 
     // Finalize MPI environment

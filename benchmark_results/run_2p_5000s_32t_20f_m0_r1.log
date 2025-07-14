@@ -1,0 +1,22 @@
+=== Parallel AdaBoost with MPI ===
+Configuration:
+  Processes: 2
+  Trees: 32
+  Data source: synthetic
+  Samples per process: 5000
+  Features: 20
+=====================================
+Starting parallel AdaBoost training with 32 trees across 2 processes
+Process 0 training tree 1/32
+Tree 1: Error=0.0650, Alpha=1.3331 (Process 0)
+Process 1 training tree 2/32
+Tree 2: Error=0.0474, Alpha=1.5004 (Process 1)
+Process 0 training tree 3/32
+Tree 3: Error=0.0438, Alpha=1.5414 (Process 0)
+Process 1 training tree 4/32
+Tree 4: Error=0.0192, Alpha=1.9658 (Process 1)
+Progress: 4/32 trees completed
+Process 0 training tree 5/32
+Tree 5: Error=0.0387, Alpha=1.6062 (Process 0)
+Process 0 training tree 7/32
+mpirun: Forwarding signal 18 to job
